@@ -56,7 +56,7 @@
  * lowering this value (1 sends a single frame per request).
  */
 #ifndef RPMB_UFS_WRITE_CHUNK
-#define RPMB_UFS_WRITE_CHUNK 8
+#define RPMB_UFS_WRITE_CHUNK 1
 #endif
 
 struct ufs_rpmb_cmd {
