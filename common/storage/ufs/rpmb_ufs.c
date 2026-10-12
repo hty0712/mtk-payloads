@@ -26,8 +26,10 @@
 #define UFS_CMD_CDB_LEN         0x0C
 
 #define UFS_DESC_UNIT           2
+#define UFS_DESC_GEOMETRY       0x07
 #define UFS_RPMB_WLUN           0xC4
 #define UFS_RPMB_DESC_LEN       0x100
+#define UFS_GEOMETRY_DESC_LEN   0x20
 
 #define RPMB_DESC_REGION_ENABLE 0x09
 #define RPMB_DESC_BLOCK_SIZE    0x0A
@@ -35,10 +37,27 @@
 #define RPMB_DESC_REGION0_SIZE  0x13
 #define RPMB_REGION_UNIT_BYTES  (128U * 1024U)
 
+/*
+ * Geometry Descriptor (UFS 3.1, 14.1.4.4): the maximum number of 256-byte
+ * blocks that may be transferred in a single RPMB request. Writing more than
+ * this makes the device reject the request (observed as RPMB result 0x0002,
+ * authentication failure), because it only consumes part of the frames.
+ */
+#define RPMB_DESC_READ_WRITE_SIZE 0x17
+
 #define RPMB_GET_WRITE_COUNTER  2
 #define RPMB_WRITE_DATA         3
 #define RPMB_READ_DATA          4
 #define RPMB_RESULT_READ        5
+
+/*
+ * Number of RPMB frames sent per SECURITY PROTOCOL OUT. Building firmware
+ * that reject authentication on large multi-frame writes can be bisected by
+ * lowering this value (1 sends a single frame per request).
+ */
+#ifndef RPMB_UFS_WRITE_CHUNK
+#define RPMB_UFS_WRITE_CHUNK 32
+#endif
 
 struct ufs_rpmb_cmd {
     u32 opcode;
@@ -66,10 +85,12 @@ static ufs_read_desc_fn g_ufs_read_desc;
 static bool g_rpmb_authenticated[MAX_RPMB_PARTS];
 static bool g_rpmb_region_enabled[MAX_RPMB_PARTS];
 static uint32_t g_rpmb_sector_count[MAX_RPMB_PARTS];
+/* Device-reported maximum blocks per RPMB request (0 = not reported). */
+static uint32_t g_rpmb_max_read_write_size;
 static struct rpmb_backend g_be;
 
 __attribute__((aligned(64))) static struct rpmb_frame g_frame;
-__attribute__((aligned(64))) static struct rpmb_frame g_write_frames[32];
+__attribute__((aligned(64))) static struct rpmb_frame g_write_frames[RPMB_UFS_WRITE_CHUNK];
 __attribute__((aligned(64))) static uint8_t g_rpmb_unit_desc[UFS_RPMB_DESC_LEN];
 
 static int rpmb_ufs_write_blocks(
@@ -352,7 +373,15 @@ static int rpmb_ufs_write_blocks(uint32_t part, uint32_t address, uint32_t block
 {
     int res;
     uint32_t wr_cnt;
-    uint32_t chunk_size = 32;
+    uint32_t chunk_size = RPMB_UFS_WRITE_CHUNK;
+
+    /*
+     * Never exceed the device's reported maximum blocks per RPMB request.
+     * Requesting more makes the device consume only part of the frames and
+     * fail the request with RPMB result 0x0002 (authentication failure).
+     */
+    if (g_rpmb_max_read_write_size > 0 && g_rpmb_max_read_write_size < chunk_size)
+        chunk_size = g_rpmb_max_read_write_size;
 
     if (part >= MAX_RPMB_PARTS) {
         printf("[RPMB-UFS] invalid write partition %u\n", part);
@@ -498,6 +527,14 @@ static void rpmb_ufs_load_region_sizes(void)
         g_rpmb_unit_desc[RPMB_DESC_REGION_ENABLE],
         g_rpmb_unit_desc[RPMB_DESC_BLOCK_SIZE]);
 
+    /* Raw descriptor dump: lets us inspect fields the DA does not decode,
+     * such as bLUWriteProtect, when a write is rejected by the device. */
+    printf("[RPMB-UFS] RPMB Unit Descriptor raw (len=%u):",
+        g_rpmb_unit_desc[0]);
+    for (uint32_t i = 0; i < g_rpmb_unit_desc[0] && i < 0x24; i++)
+        printf(" %02x", g_rpmb_unit_desc[i]);
+    printf("\n");
+
     uint64_t logical_blocks = read_be64(&g_rpmb_unit_desc[RPMB_DESC_BLOCK_COUNT]);
     uint32_t region_units_total = 0;
     for (uint32_t part = 0; part < MAX_RPMB_PARTS; part++) {
@@ -538,6 +575,34 @@ static void rpmb_ufs_load_region_sizes(void)
             g_rpmb_region_enabled[part],
             g_rpmb_sector_count[part],
             g_rpmb_sector_count[part] * RPMB_DATA_SZ);
+}
+
+static void rpmb_ufs_load_read_write_size(void)
+{
+    g_rpmb_max_read_write_size = 0;
+
+    if (!g_ufs_read_desc)
+        return;
+
+    void *ufs = g_ufs_get_lu(0);
+    if (!ufs)
+        return;
+
+    uint8_t desc[UFS_GEOMETRY_DESC_LEN] = {0};
+    int res = g_ufs_read_desc(ufs, UFS_DESC_GEOMETRY, 0, 0, desc, sizeof(desc));
+    if (res != 0) {
+        printf("[RPMB-UFS] Geometry Descriptor query failed: %d\n", res);
+        return;
+    }
+
+    if (desc[0] <= RPMB_DESC_READ_WRITE_SIZE || desc[1] != UFS_DESC_GEOMETRY) {
+        printf("[RPMB-UFS] invalid Geometry Descriptor: len=%u type=0x%02x\n", desc[0], desc[1]);
+        return;
+    }
+
+    g_rpmb_max_read_write_size = desc[RPMB_DESC_READ_WRITE_SIZE];
+    printf("[RPMB-UFS] bRPMB_ReadWriteSize=%u (max blocks per RPMB request)\n",
+        g_rpmb_max_read_write_size);
 }
 
 static uint32_t rpmb_ufs_get_sector_count(uint32_t part)
@@ -588,6 +653,7 @@ int rpmb_ufs_setup(
     rpmb_set_backend(&g_be);
 
     rpmb_ufs_load_region_sizes();
+    rpmb_ufs_load_read_write_size();
 
     printf("[RPMB-UFS] backend setup complete\n");
     return 0;
